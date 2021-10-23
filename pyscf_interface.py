@@ -19,9 +19,7 @@ Created on Wed Jun 30 11:34:14 2021
 import numpy as np
 from pyscf import scf, gto
 import scipy.linalg as linalg
-
 from tqdm import tqdm
-
 
 Z_mass = np.array([ 1.,   1837.,   7297.,  
                    12650., 16427.,  19705.,  21894.,  25533.,  29164.,  34631., 36785.,  
@@ -193,8 +191,8 @@ class pyscf_UHF(object):
         if isinstance(basis, str):
             (self.pyscf_mol).basis = basis
         
+        (self.pyscf_mol).verbose = 1 ### why not 0??
         charges = (self.pyscf_mol).atom_charges()
-        #nuc_charge_center = np.einsum("i,ix -> x", charges, (self.pyscf_mol).atom_coords() ) / np.sum( charges )
         CoM = np.einsum('i, ix-> x', (self.pyscf_mol).atom_mass_list(isotope_avg=True), (self.pyscf_mol).atom_coords() ) / np.sum( (self.pyscf_mol).atom_mass_list(isotope_avg=True) )
         #CoM = np.einsum('i, ix-> x', mole.atom_mass_list(isotope_avg=False), mole.atom_coords() ) / np.sum( mole.atom_mass_list(isotope_avg=False) )
         (self.pyscf_mol).set_common_orig_( CoM ) ### ohh partial charges??? 
@@ -202,8 +200,12 @@ class pyscf_UHF(object):
         (self.pyscf_mol).set_common_orig_(CoM)
         (self.pyscf_mol).build()
         
+        self.mass = ((self.pyscf_mol()).atom_mass_list())*1822.89
+        self.xyz  = (self.pyscf_mol()).atom_coords()
+        self.Z    = np.asarray([element[0] for element in (self.pyscf_mol())._atom])
+        
     def Calc(self):
-        UHF_pyscf = scf.UHF(self.pyscf_mol)
+        UHF_pyscf = scf.UHF(self.pyscf_mol) #, verbose=0)
         self.pyscfuhf = UHF_pyscf
         (self.pyscfuhf).conv_tol = 1e-12
         (self.pyscfuhf).kernel()
@@ -320,6 +322,21 @@ class pyscf_UHF(object):
         ## Pulay
         fix += 1.0*np.einsum('ij, IXjk, kl, il -> IX', DA, self.dS, DA, FA, optimize=True)
         fix += 1.0*np.einsum('ij, IXjk, kl, il -> IX', DB, self.dS, DB, FB, optimize=True)
+        return fix
+    
+    def get_Cforce(self, DA, DB, FA, FB): ## added may 22
+        D = DA + DB    
+    
+        ## Hellman Feynman
+        fix  = -grad_nuc(self.pyscf_mol).astype(complex)
+        fix -= 1.0*np.einsum('mn, IXmn -> IX',  D, (self.dH).astype(complex))
+        fix -= 0.5*np.einsum('nm, ls, IXmnls -> IX',  D,  D, (self.dI).astype(complex), optimize=True) ## dJ
+        fix += 0.5*np.einsum('nm, ls, IXmlsn -> IX', DA, DA, (self.dI).astype(complex), optimize=True) ## dKα
+        fix += 0.5*np.einsum('nm, ls, IXmlsn -> IX', DB, DB, (self.dI).astype(complex), optimize=True) ## dKβ
+        
+        ## Pulay
+        fix += 1.0*np.einsum('ij, IXjk, kl, il -> IX', DA, (self.dS).astype(complex), DA, FA, optimize=True)
+        fix += 1.0*np.einsum('ij, IXjk, kl, il -> IX', DB, (self.dS).astype(complex), DB, FB, optimize=True)
         return fix
     
     def get_dM(self, return_AO=False):
@@ -726,162 +743,283 @@ class pyscf_UHF(object):
         
         return None
     
-    def RT_RK(self):
-        """
-        Given Field + Atoms
-        Get Current
-        """
-        
-        return None
+    def getAO(self, DA, DB):
+        ## transform MO density into an AO density 
+        return ( (self.Ca)@ DA @((self.Ca).T) ), ( (self.Cb)@ DB @((self.Cb).T) )
     
-    def RT_UT(self):
-        """
-        Given Field + Atoms
-        Get Current
-        """
-        
-        return None
+    def getMO(self, FA, FB):
+        ## transform AO Fock into an MO Fock 
+        return ( ((self.Ca).T)@ FA @(self.Ca) ), ( ((self.Cb).T)@ FB @(self.Cb) )
     
-    def RT_MMUT(self, DA_t=None, DB_t=None, dt = 0.002, dT = 1000, onoff=1.0, field=None):
-        """
-        Given Atoms
-        Get U^[ix]_pq
-        """
-    
+    def RTHF_MMUTtqdm(self, DA_t=None, DB_t=None, dt = 0.002, dT = 1000, onoff=1.0, field=None, MD=False, Current=False, probe=False):
+
         tsteps = int(dT/dt)
-        
-        if DA_t is None:
-            DA_t = 1.*self.Da_mo
-        if DB_t is None:
-            DB_t = 1.*self.Db_mo
+
+        #if DA_t is None:
+        DA_t = self.Da_mo
+        #if DB_t is None:
+        DB_t = self.Db_mo
         if field is None:
-            field = E_field()
-            field.E0 = 0.
-            field.Γ  = 100.
-        
+            def field(t):
+                return np.zeros(3)
+
         ### compute initial half step propagators?
+        DA_ao   = ( self.Ca ) @ (DA_t) @ ( (self.Ca).T)
+        DB_ao   = ( self.Cb ) @ (DB_t) @ ( (self.Cb).T)
+        FA_ao, FB_ao = self.get_UFock(DA_ao, DB_ao)
+        FA0_mo  = ((self.Ca).T) @ FA_ao @ (self.Ca)
+        FB0_mo  = ((self.Cb).T) @ FB_ao @ (self.Cb)
+        UA_half = Expm( -1j*FA0_mo*dt/2 ) #!!!
+        UB_half = Expm( -1j*FB0_mo*dt/2 ) #!!!
+        DA_half = (UA_half.conj().T) @ DA_t @ (UA_half)
+        DB_half = (UB_half.conj().T) @ DB_t @ (UB_half)
+
+        if MD:
+            f_ix = np.zeros(((self.dS).shape[0], (self.dS).shape[1]))
+        if Current:
+            J = np.zeros((tsteps, 2, len(self.Da_mo), len(self.Da_mo)), dtype=complex)
+        if probe:
+            energy = np.zeros(tsteps)
+            trace  = np.zeros(tsteps)
         d_tx = np.zeros((tsteps, 3))
-        J    = np.zeros((tsteps, 2, len(self.Da_mo), len(self.Da_mo)), dtype=complex)
-        for step in (range(tsteps)):
-            t = step * dt
-        
-            # get AO density matrices
-            DA_ao = ( self.Ca ) @ DA_t @ ( (self.Ca).T)
-            DB_ao = ( self.Cb ) @ DB_t @ ( (self.Cb).T)
-            d_tx[step] = np.einsum('xAB, AB -> x', self.D, ( 1.*DA_ao + 1.*DB_ao ) ).real
-            
-            # save to current
-            J[step, 0] = DA_t
-            J[step, 1] = DB_t
-            
-            # compute FA_t, FB_t
-            FA_ao, FB_ao = self.get_UFock(DA_ao, DB_ao) - onoff * np.einsum('xmn, x -> mn', self.D, field.getEE(t) )
-            FA = ((self.Ca).T) @ FA_ao @ (self.Ca)
-            FB = ((self.Cb).T) @ FB_ao @ (self.Cb)
-            
-            # compute propagators
-            UA  = Expm( -1j*FA*dt/2 ) #!!!
-            UB  = Expm( -1j*FB*dt/2 ) #!!!
-            
-            # half step forward
-            DAt_mo = (UA) @ DA_t @ (UA.conj().T)
-            DBt_mo = (UB) @ DB_t @ (UB.conj().T)
-            
-            # get AO density matrices
-            DA_ao = ( self.Ca ) @ DAt_mo @ ( (self.Ca).T)
-            DB_ao = ( self.Cb ) @ DBt_mo @ ( (self.Cb).T)
-            
-            # compute FA_t, FB_t
-            t = (step + 0.5) * dt
-            FA_ao, FB_ao = self.get_UFock(DA_ao, DB_ao) - onoff * np.einsum('xmn, x -> mn', self.D, field.getEE(t) )
-            FA = ((self.Ca).T) @ FA_ao @ (self.Ca)
-            FB = ((self.Cb).T) @ FB_ao @ (self.Cb)
-            
-            # compute propagators
-            UA  = Expm( -1j*FA*dt ) #!!!
-            UB  = Expm( -1j*FB*dt ) #!!!        
-            
-            # full step forward
-            DA_t = (UA) @ DA_t @ (UA.conj().T)
-            DB_t = (UB) @ DB_t @ (UB.conj().T)
-    
-        d_tx -= np.einsum("tx -> x", d_tx)/len(d_tx)
-        return np.linspace(0, dt*tsteps, tsteps, endpoint=False), d_tx, J
-    
-    def RT_MMUT_force(self, DA_t=None, DB_t=None, dt = 0.02, dT = 1000, onoff=1.0, field=None, return_current=False):
-        """
-        RT-HF+dipole_interaction to obtain dipole and forces in dt time-increments
-        """
-    
-        tsteps = int(dT/dt)
-        
-        if DA_t is None:
-            DA_t = 1.*self.Da_mo
-        if DB_t is None:
-            DB_t = 1.*self.Db_mo
-        if field is None:
-            field = E_field()
-            field.E0 = 0.
-            field.Γ  = 100.
-        
-        ### compute initial half step propagators?
-        f_ix = np.zeros( (self.dH.shape[0], self.dH.shape[1]) )
-        d_tx = np.zeros((tsteps, 3))
-        J    = np.zeros((tsteps, 2, len(self.Da_mo), len(self.Da_mo)), dtype=complex)
         for step in tqdm(range(tsteps)):
             t = step * dt
-        
+
             # get AO density matrices
             DA_ao = ( self.Ca ) @ DA_t @ ( (self.Ca).T)
             DB_ao = ( self.Cb ) @ DB_t @ ( (self.Cb).T)
-            d_tx[step] = np.einsum('xAB, AB -> x', self.D, ( 1.*DA_ao + 1.*DB_ao ) ).real
-           
-            # save to current
-            J[step, 0] = DA_t
-            J[step, 1] = DB_t
-            
+
             # compute FA_t, FB_t
             FA_ao, FB_ao = self.get_UFock(DA_ao, DB_ao) - onoff * np.einsum('xmn, x -> mn', self.D, field.getEE(t) )
-            f_ix  += self.get_force(DA_ao.real, DB_ao.real, FA_ao.real, FB_ao.real)
+
+            # save to stuff
+            d_tx[step] = np.einsum('xAB, AB -> x', self.D, ( DA_ao + DB_ao ).real )
+            if Current:
+                J[step, 0] = DA_t
+                J[step, 1] = DB_t
+            if probe:
+                trace[step] = np.einsum("ii -> ", DA_t + DB_t).real
+                energy[step] = self.get_Euhf(DA_ao, DB_ao, FA_ao, FB_ao).real
+            if MD:
+                f_ix += self.get_Cforce(DA_ao, DB_ao, FA_ao, FB_ao).real
+
             FA = ((self.Ca).T) @ FA_ao @ (self.Ca)
             FB = ((self.Cb).T) @ FB_ao @ (self.Cb)
-            
+
             # compute propagators
-            UA  = Expm( -1j*FA*dt/2 ) #!!!
-            UB  = Expm( -1j*FB*dt/2 ) #!!!
-            
+            UA_half = Expm( -1j*FA*dt/2 ) #!!!
+            UB_half = Expm( -1j*FB*dt/2 ) #!!!
+
             # half step forward
-            DAt_mo = (UA) @ DA_t @ (UA.conj().T)
-            DBt_mo = (UB) @ DB_t @ (UB.conj().T)
-            
+            DA_half = (UA_half) @ DA_half @ (UA_half.conj().T)
+            DB_half = (UB_half) @ DB_half @ (UB_half.conj().T)
+
             # get AO density matrices
-            DA_ao = ( self.Ca ) @ DAt_mo @ ( (self.Ca).T)
-            DB_ao = ( self.Cb ) @ DBt_mo @ ( (self.Cb).T)
-            
+            DA_ao = ( self.Ca ) @ DA_half @ ( (self.Ca).T)
+            DB_ao = ( self.Cb ) @ DB_half @ ( (self.Cb).T)
+
             # compute FA_t, FB_t
             t = (step + 0.5) * dt
             FA_ao, FB_ao = self.get_UFock(DA_ao, DB_ao) - onoff * np.einsum('xmn, x -> mn', self.D, field.getEE(t) )
             FA = ((self.Ca).T) @ FA_ao @ (self.Ca)
             FB = ((self.Cb).T) @ FB_ao @ (self.Cb)
-            
+
             # compute propagators
             UA  = Expm( -1j*FA*dt ) #!!!
             UB  = Expm( -1j*FB*dt ) #!!!        
-            
+
             # full step forward
             DA_t = (UA) @ DA_t @ (UA.conj().T)
             DB_t = (UB) @ DB_t @ (UB.conj().T)
-    
-        f_ix *= 1/len(d_tx)
+
         d_tx -= np.einsum("tx -> x", d_tx)/len(d_tx)
-        if return_current:
-            return np.linspace(0, dt*tsteps, tsteps, endpoint=False), d_tx, J, f_ix
+        if MD:
+            f_ix  = f_ix/tsteps
+            return np.linspace(0, dt*tsteps, tsteps, endpoint=False), d_tx, f_ix, DA_t, DB_t
+        if probe:
+            return np.linspace(0, dt*tsteps, tsteps, endpoint=False), d_tx, trace, energy
+        if Current:
+            return np.linspace(0, dt*tsteps, tsteps, endpoint=False), d_tx, J
+        else:
+            return np.linspace(0, dt*tsteps, tsteps, endpoint=False), d_tx
     
-        else: ##np.linspace(0, dt*tsteps, tsteps, endpoint=False)
-            return np.linspace(0, dt*tsteps, tsteps, endpoint=False), d_tx, J[-1, 0], J[-1, 1], f_ix
+    def RTHF_UT(self, DA_t=None, DB_t=None, dt = 0.002, dT = 100, onoff=1.0, field=None, MD=False, Current=False, probe=False):
+        tsteps = int(dT/dt)
+
+        DA_t = 1.*(self.Da_mo)
+        DB_t = 1.*(self.Db_mo)
+        if field is None:
+            field = E_field()
+            field.E0 = 0.
+            field.Γ  = 100.
+            
+
+        if MD:
+            f_ix = np.zeros(((self.dS).shape[0], (self.dS).shape[1]))
+        if Current:
+            J = np.zeros((tsteps, 2, len(self.Da_mo), len(self.Da_mo)), dtype=complex)
+        if probe:
+            energy = np.zeros(tsteps)
+            trace  = np.zeros(tsteps)
+        d_tx   = np.zeros((tsteps, 3))
+        for step in (range(tsteps)):
+            t = (step) * dt
+
+            # get AO density matrices
+            DA_ao, DB_ao = self.getAO(DA_t, DB_t)
+            d_tx[step]  = np.einsum('xAB, AB -> x', self.D, ( DA_ao + DB_ao ).real )
+
+            # compute FA, FB and transform to MO basis
+            FA_ao, FB_ao = self.get_UCFock(DA_ao, DB_ao) - onoff * np.einsum('xAB, x -> AB', self.D, field.getEE(t) )
+            FA, FB = self.getMO(FA_ao, FB_ao)
+
+            ####
+            if Current:
+                J[step, 0] = DA_t
+                J[step, 1] = DB_t
+            if probe:
+                trace[step] = np.einsum("ii -> ", DA_t + DB_t).real
+                energy[step] = self.get_Euhf(DA_ao, DB_ao, FA_ao, FB_ao).real
+            if MD:
+                f_ix += self.get_Cforce(DA_ao, DB_ao, FA_ao, FB_ao).real
+            ####
+
+            # compute propagators
+            UA  = Expm( -1j*(dt)*FA )
+            UB  = Expm( -1j*(dt)*FB )
+
+            ### full step forward
+            DA_t  = (UA) @ DA_t @ (UA.conj().T)
+            DB_t  = (UB) @ DB_t @ (UB.conj().T)
+
+
+        d_tx -= np.einsum("tx -> x", d_tx)/len(d_tx)
+
+        if MD:
+            f_ix  = f_ix/tsteps
+            return np.linspace(0, dt*tsteps, tsteps, endpoint=False), d_tx, f_ix, DA_t, DB_t
+        if Current:
+            return np.linspace(0, dt*tsteps, tsteps, endpoint=False), d_tx, J
+        if probe:
+            return np.linspace(0, dt*tsteps, tsteps, endpoint=False), d_tx, trace, energy
+        else:
+            return np.linspace(0, dt*tsteps, tsteps, endpoint=False), d_tx
     
-    
-    
+    def RTHF_RK4(self, DA_t=None, DB_t=None, dt = 0.002, dT = 100, onoff=1.0, field=None, MD=False, Current=False, probe=False):
+        """ With Electric Dipole Interaction """
+        """
+        DA_t, DB_t = Initial MO Density (2d np.array)
+        CA_T, CB_T = Coefficients in dT (2d np.array)
+        dt     = Electronic Time Step (float)
+        dT     = # of Electronic Time Steps (int)
+        onoff  = Number to turn: off = 0 & on = 1 interaction (float)
+        dipole = dipole integral in given direction (2d np.array)
+        """
+        tsteps = int(dT/dt)
+
+        
+        DA_t = 1.*(self.Da_mo)
+        DB_t = 1.*(self.Db_mo)
+        if field is None:
+            field = E_field()
+            field.E0 = 0.
+            field.Γ  = 100.
+
+        #time  = np.linspace(0, dT, int(dT/dt), endpoint=False)
+        if MD:
+            f_ix = np.zeros(self.dS.shape)
+        if Current:
+            J = np.zeros((tsteps, 2, len(self.Da_mo), len(self.Da_mo)), dtype=complex)
+        if probe:
+            energy = np.zeros(tsteps)
+            trace  = np.zeros(tsteps)
+
+        time = np.linspace(0, dt*dT, dT, endpoint=False)
+        d_tx = np.zeros((tsteps, 3))
+        for step in tqdm(range(tsteps)):
+            # =============================================================================
+            # Runge-Kutta 4th Order Integrator
+            # =============================================================================
+            # compute K1
+            t = (step + 0.0) * dt
+            # =============================================================================
+            DA_ao, DB_ao = self.getAO(DA_t, DB_t)
+            d_tx[step]  = np.einsum('xAB, AB -> x', self.D, ( DA_ao + DB_ao ).real )
+
+            FA_ao, FB_ao = self.get_UCFock(DA_ao, DB_ao) - onoff * np.einsum('xAB, x -> AB', self.D, field.getEE(t) )
+
+            if Current:
+                J[step, 0] = DA_t
+                J[step, 1] = DB_t
+            if probe:
+                trace[step] = np.einsum("ii -> ", DA_t + DB_t).real
+                energy[step] = self.get_Euhf(DA_ao, DB_ao, FA_ao, FB_ao).real
+            if MD:
+                f_ix += self.get_force(DA_ao, DB_ao, FA_ao, FB_ao)
+
+            F_t_αe = ((self.Ca).T) @ FA_ao @ (self.Ca) 
+            F_t_βe = ((self.Cb).T) @ FB_ao @ (self.Cb)
+            K1_αe = -1j*(F_t_αe@DA_t - DA_t@F_t_αe)
+            K1_βe = -1j*(F_t_βe@DB_t - DB_t@F_t_βe)
+
+            tempD_αe = DA_t + 0.5 * dt * K1_αe
+            tempD_βe = DB_t + 0.5 * dt * K1_βe
+
+
+            # compute K2
+            t = (step + 0.5) * dt
+            DA_ao, DB_ao = self.getAO(tempD_αe, tempD_βe)
+            # =============================================================================
+            FA_ao, FB_ao = self.get_UCFock(DA_ao, DB_ao) - onoff * np.einsum('xAB, x -> AB', self.D, field.getEE(t) )
+            F_t_αe = ((self.Ca).T) @ FA_ao @ (self.Ca) 
+            F_t_βe = ((self.Cb).T) @ FB_ao @ (self.Cb)
+            K2_αe = -1j*(F_t_αe@tempD_αe - tempD_αe@F_t_αe)
+            K2_βe = -1j*(F_t_βe@tempD_βe - tempD_βe@F_t_βe)
+
+            tempD_αe = DA_t + 0.5 * dt * K2_αe
+            tempD_βe = DB_t + 0.5 * dt * K2_βe
+
+
+            # compute K3
+            DA_ao, DB_ao = self.getAO(tempD_αe, tempD_βe)
+            FA_ao, FB_ao = self.get_UCFock(DA_ao, DB_ao) - onoff * np.einsum('xAB, x -> AB', self.D, field.getEE(t) )
+            F_t_αe = ((self.Ca).T) @ FA_ao @ (self.Ca) 
+            F_t_βe = ((self.Cb).T) @ FB_ao @ (self.Cb)
+            K3_αe = -1j*(F_t_αe@tempD_αe - tempD_αe@F_t_αe)
+            K3_βe = -1j*(F_t_βe@tempD_βe - tempD_βe@F_t_βe)
+
+            tempD_αe = DA_t + 1.0 * dt * K3_αe
+            tempD_βe = DB_t + 1.0 * dt * K3_βe
+
+
+            # compute K4
+            t = (step + 1.0) * dt
+            DA_ao, DB_ao = self.getAO(tempD_αe, tempD_βe)
+            # =============================================================================
+            FA_ao, FB_ao = self.get_UCFock(DA_ao, DB_ao) - onoff * np.einsum('xAB, x -> AB', self.D, field.getEE(t) )
+            F_t_αe = ((self.Ca).T) @ FA_ao @ (self.Ca) 
+            F_t_βe = ((self.Cb).T) @ FB_ao @ (self.Cb)
+            K4_αe = -1j*(F_t_αe@tempD_αe - tempD_αe@F_t_αe)
+            K4_βe = -1j*(F_t_βe@tempD_βe - tempD_βe@F_t_βe)
+
+            DA_t += (dt/6.0) * (K1_αe + 2.0 * K2_αe + 2.0 * K3_αe + K4_αe) 
+            DB_t += (dt/6.0) * (K1_βe + 2.0 * K2_βe + 2.0 * K3_βe + K4_βe)
+
+
+            # =============================================================================
+            # Output MO Currents
+            # =============================================================================
+
+        d_tx -= np.einsum("tx -> x", d_tx)/len(d_tx)
+        
+        if Current:
+            return np.linspace(0, dt*tsteps, tsteps, endpoint=False), d_tx, J
+        if MD:
+            return np.linspace(0, dt*tsteps, tsteps, endpoint=False), d_tx, f_ix, DA_t, DB_t
+        if probe:
+            return np.linspace(0, dt*tsteps, tsteps, endpoint=False), d_tx, trace, energy
+        else:
+            return np.linspace(0, dt*tsteps, tsteps, endpoint=False), d_tx
     
 class E_field(object):
     ''' A class of Electric Field Pulses '''
@@ -908,7 +1046,8 @@ class E_field(object):
     
     def getEE(self, t):
         """ Vectored E-field for a given time/instant t """
-        return ( self.E0 * np.exp( - 4*np.log(2) * (t - self.t0)**2/(self.Γ**2) ) * np.exp( -1j * self.ω * (t - self.t0) + 1j * self.phase )) * (self.vector)
+        return ( self.E0 * np.exp( - 4*np.log(2) * (t - self.t0)**2/(self.Γ**2) ) * np.sin( self.ω * (t - self.t0) + 1j * self.phase )) * (self.vector)
+        #return ( self.E0 * np.exp( - 4*np.log(2) * (t - self.t0)**2/(self.Γ**2) ) * np.exp( -1j * self.ω * (t - self.t0) + 1j * self.phase )) * (self.vector)
     
     def getEE_whole(self, t):
         """ Vectored E-field for a given time/instant t """
