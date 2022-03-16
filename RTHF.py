@@ -20,7 +20,7 @@ def getFMX(Da, Db, H1, H2):
     Fβ = H1 + J - np.sum(H2.swapaxes(1,2)*Db, axis=(2,3))
     return Fα, Fβ
 
-def RTHF_setup(uhf_pyscf, dt=0.002, dT=100, field=None):
+def RTHF_setup(uhf_pyscf, D=None, dt=0.002, dT=100, field=None):
 
     tsteps = int(dT/dt)
     t      = np.arange(0, dT, dt)
@@ -29,9 +29,12 @@ def RTHF_setup(uhf_pyscf, dt=0.002, dT=100, field=None):
     else:
         E_t = field.getEE(t)
 
-    DA_mo, DB_mo = (uhf_pyscf).mo_occ
-    DA_mo  = np.diag(DA_mo).astype(complex)
-    DB_mo  = np.diag(DB_mo).astype(complex)
+    if D is None:
+        DA_mo, DB_mo = (uhf_pyscf).mo_occ
+        DA_mo  = np.diag(DA_mo).astype(complex)
+        DB_mo  = np.diag(DB_mo).astype(complex)
+    else:
+        DA_mo, DB_mo = D[0], D[1]
 
     Ca, Cb = (uhf_pyscf).mo_coeff
     dipole = (uhf_pyscf.mol).intor("int1e_r")
