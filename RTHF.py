@@ -21,13 +21,22 @@ def getFMX(Da, Db, H1, H2):
     return Fα, Fβ
 
 def RTHF_setup(uhf_pyscf, D=None, dt=0.002, dT=100, field=None):
+    """
+    GIVEN:  dt (electronic time-step), 
+            dT (nuclei time-step), 
+            D (initial MO density-matrix 3D numpy D_spq ),
+            uhf_pyscf (uhf class)
+            field (2D numpy array representing real-time electric-field)
+    GET:    d_tx: dynamic dipole
+            energy: energy of system in time
+            trace: trace of MO density matrix in time
+            Dao: AO current
+    """
 
     tsteps = int(dT/dt)
     t      = np.arange(0, dT, dt)
     if field is None:
-        E_t = np.zeros((tsteps,3))
-    else:
-        E_t = field.getEE(t)
+        field = np.zeros((tsteps,3))
 
     if D is None:
         DA_mo, DB_mo = (uhf_pyscf).mo_occ
@@ -42,8 +51,7 @@ def RTHF_setup(uhf_pyscf, D=None, dt=0.002, dT=100, field=None):
     H1    += (uhf_pyscf.mol).intor("int1e_nuc")
     H2     = (uhf_pyscf.mol).intor("int2e") ###!! dont calculate!!
 
-    #DA_mo, DB_mo, Davg, d_tx = RTHF_dipole(Ca, Cb, DA_mo, DB_mo, H1, H2, E_t, dipole, dt)
-    Dao_out, d_tx, trace, energy = RTHF(Ca, Cb, DA_mo, DB_mo, H1, H2, E_t, dipole, dt)
+    Dao_out, d_tx, trace, energy = RTHF(Ca, Cb, DA_mo, DB_mo, H1, H2, field, dipole, dt)
 
     return t, d_tx, energy, trace, Dao_out
 
