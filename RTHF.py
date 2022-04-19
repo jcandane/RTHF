@@ -30,11 +30,10 @@ def RTHF_setup(uhf_pyscf, D=None, dt=0.002, dT=100, field=None):
     GET:    d_tx: dynamic dipole
             energy: energy of system in time
             trace: trace of MO density matrix in time
-            Dao: AO current
+            Dao: AO average out
     """
 
     tsteps = int(dT/dt)
-    t      = np.arange(0, dT, dt)
     if field is None:
         field = np.zeros((tsteps,3))
 
@@ -51,9 +50,9 @@ def RTHF_setup(uhf_pyscf, D=None, dt=0.002, dT=100, field=None):
     H1    += (uhf_pyscf.mol).intor("int1e_nuc")
     H2     = (uhf_pyscf.mol).intor("int2e") ###!! dont calculate!!
 
-    Dao_out, d_tx, trace, energy = RTHF(Ca, Cb, DA_mo, DB_mo, H1, H2, field, dipole, dt)
+    Davg, Dao_out, d_tx, trace, energy = RTHF(Ca, Cb, DA_mo, DB_mo, H1, H2, field, dipole, dt)
 
-    return t, d_tx, energy, trace, Dao_out
+    return d_tx, energy, trace, Davg, Dao_out
 
 def RTHF(Ca, Cb, DA_mo, DB_mo, H1, H2, E_t, dipole, dt):
 
@@ -61,7 +60,7 @@ def RTHF(Ca, Cb, DA_mo, DB_mo, H1, H2, E_t, dipole, dt):
     d_tx   = np.zeros((tsteps, 3))
     energy = np.zeros(tsteps)
     trace  = np.zeros(tsteps)
-    D_out  = np.zeros((tsteps, 2, len(Ca), len(Ca)), dtype=np.complex128)
+    Davg   = np.zeros((2, len(Ca), len(Ca)), dtype=np.complex128)
     for step in (range(tsteps)):
         t = (step) * dt
         
@@ -71,7 +70,7 @@ def RTHF(Ca, Cb, DA_mo, DB_mo, H1, H2, E_t, dipole, dt):
 
         #### probe
         DD           = ( DA_ao + DB_ao ).real
-        D_out[step]  = np.array([DA_ao, DB_ao])
+        Davg        += np.array([DA_ao, DB_ao])
         d_tx[step]   = np.array([np.trace(dipole[0] @ DD), np.trace(dipole[1] @ DD), np.trace(dipole[2] @ DD)])
         trace[step]  = np.trace(DA_mo.real + DA_mo.real)
         energy[step] = np.trace((H1 + Fa_ao) @ DA_ao/2).real + np.trace((H1 + Fb_ao) @ (DB_ao/2)).real
@@ -83,9 +82,9 @@ def RTHF(Ca, Cb, DA_mo, DB_mo, H1, H2, E_t, dipole, dt):
         DA_mo = (UA) @ DA_mo @ ((UA).conj().T)
         DB_mo = (UB) @ DB_mo @ ((UB).conj().T)
 
-    d_tx -= np.einsum("tx -> x", d_tx)/len(d_tx)
-
-    return D_out, d_tx, trace, energy
+    d_tx  -= np.einsum("tx -> x", d_tx)/len(d_tx)
+    Davg *= 1/len(d_tx)
+    return Davg, np.array([DA_ao, DB_ao]), d_tx, trace, energy
 
 
 class E_field(object):
