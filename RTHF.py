@@ -20,7 +20,7 @@ def getFMX(Da, Db, H1, H2):
     Fβ = H1 + J - np.sum(H2.swapaxes(1,2)*Db, axis=(2,3))
     return Fα, Fβ
 
-def RTHF_setup(uhf_pyscf, D=None, dt=0.002, dT=100, field=None):
+def RTHF_setup(uhf_pyscf, D=None, dt=0.002, dT=100, field=None, current=False):
     """
     GIVEN:  dt (electronic time-step), 
             dT (nuclei time-step), 
@@ -51,17 +51,22 @@ def RTHF_setup(uhf_pyscf, D=None, dt=0.002, dT=100, field=None):
     H1    += (uhf_pyscf.mol).intor("int1e_nuc")
     H2     = (uhf_pyscf.mol).intor("int2e") ###!! dont calculate!!
 
-    Dao_out, d_tx, trace, energy = RTHF(Ca, Cb, DA_mo, DB_mo, H1, H2, field, dipole, dt)
+    if current:
+        D_tspq, Dao_out, d_tx, trace, energy = RTHF(Ca, Cb, DA_mo, DB_mo, H1, H2, field, dipole, dt, current=True)
+        return t, d_tx, energy, trace, D_tspq, Dao_out
+    else:
+        Dao_out, d_tx, trace, energy = RTHF(Ca, Cb, DA_mo, DB_mo, H1, H2, field, dipole, dt, current=False)
+        return t, d_tx, energy, trace, Dao_out
 
-    return t, d_tx, energy, trace, Dao_out
-
-def RTHF(Ca, Cb, DA_mo, DB_mo, H1, H2, E_t, dipole, dt):
+def RTHF(Ca, Cb, DA_mo, DB_mo, H1, H2, E_t, dipole, dt, current=False):
 
     tsteps = len(E_t)
     d_tx   = np.zeros((tsteps, 3))
     energy = np.zeros(tsteps)
     trace  = np.zeros(tsteps)
-    D_out  = np.zeros((tsteps, 2, len(Ca), len(Ca)), dtype=np.complex128)
+    Davg   = np.zeros((2, len(Ca), len(Ca)), dtype=np.complex128)
+    if current:
+        D_out  = np.zeros((tsteps, 2, len(Ca), len(Ca)), dtype=np.complex128)
     for step in (range(tsteps)):
         t = (step) * dt
         
@@ -71,10 +76,13 @@ def RTHF(Ca, Cb, DA_mo, DB_mo, H1, H2, E_t, dipole, dt):
 
         #### probe
         DD           = ( DA_ao + DB_ao ).real
-        D_out[step]  = np.array([DA_ao, DB_ao])
+        #D_out[step]  = np.array([DA_ao, DB_ao])
+        Davg += np.array([DA_ao, DB_ao])
         d_tx[step]   = np.array([np.trace(dipole[0] @ DD), np.trace(dipole[1] @ DD), np.trace(dipole[2] @ DD)])
         trace[step]  = np.trace(DA_mo.real + DA_mo.real)
         energy[step] = np.trace((H1 + Fa_ao) @ DA_ao/2).real + np.trace((H1 + Fb_ao) @ (DB_ao/2)).real
+        if current:
+            D_out[step]  = np.array([DA_mo, DB_mo])
 
         #### unitary propagators
         UA  = Expm( -1j*(dt)*FA_mo )
@@ -84,8 +92,10 @@ def RTHF(Ca, Cb, DA_mo, DB_mo, H1, H2, E_t, dipole, dt):
         DB_mo = (UB) @ DB_mo @ ((UB).conj().T)
 
     d_tx -= np.einsum("tx -> x", d_tx)/len(d_tx)
-
-    return D_out, d_tx, trace, energy
+    if current:
+        return D_out, Davg, d_tx, trace, energy
+    else:
+        return Davg, d_tx, trace, energy
 
 
 class E_field(object):
